@@ -1,0 +1,1511 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FLAPPY MASS</title>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+    <style>
+        :root {
+            --bg: #141414;
+            --panel: #0b0b0b;
+            --ink: #f4f4f4;
+            --accent: #f7df1e;
+            --accent2: #39d5ff;
+            --danger: #ff4d4d;
+        }
+
+        html,
+        body {
+            margin: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: radial-gradient(circle at top, #2b2b2b 0%, #171717 45%, #0c0c0c 100%);
+            font-family: "Courier New", monospace;
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #game-wrap {
+            position: relative;
+            box-shadow: 18px 18px 0 #000;
+            border: 4px solid #fff;
+            background: #111;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        .hud-note {
+            position: absolute;
+            left: 10px;
+            bottom: 10px;
+            color: #ddd;
+            background: rgba(0, 0, 0, .45);
+            border: 2px solid rgba(255, 255, 255, .18);
+            padding: 6px 8px;
+            font-size: 12px;
+            letter-spacing: .3px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+
+<body>
+
+    <script>
+        const WIDTH = 420;
+        const HEIGHT = 700;
+        const PIPE_WIDTH = 72;
+        const CAP_H = 20;
+        const BASE_PIPE_SPEED = 210;
+        const PIPE_SPACING_PX = 300;
+        const HOLD_THRESHOLD = 180;  // ms para distinguir tap (pulo) de hold (encolhe)
+        const SHRINK_MIN_COOLDOWN = 500;  // cooldown mínimo mesmo com uso brevíssimo
+        const SHRINK_DURATION = 1200;
+        const SHRINK_COOLDOWN = 3000;
+        const FLOOR_Y = HEIGHT - 68;
+        const MIN_PIPE_H = 60;
+
+        const GAME_STATE = { READY: 'ready', PLAYING: 'playing', DEAD: 'dead' };
+
+        let game = new Phaser.Game({
+            type: Phaser.AUTO, parent: 'game-wrap', width: WIDTH, height: HEIGHT,
+            backgroundColor: '#161616',
+            physics: { default: 'arcade', arcade: { gravity: { y: 0 }, debug: false } },
+            scene: { preload, create, update }
+        });
+
+        function preload() { }
+
+        function create() {
+            const scene = this;
+            this.lastClickTime = 0;       // Armazena o timestamp do último clique
+            this.shrinkLocked = false;    // Indica se o modo está travado (pelo clique duplo)
+            const DOUBLE_TAP_DELAY = 300; // Janela de tempo (ms) para considerar clique duplo
+            scene.state = GAME_STATE.READY;
+            scene.score = 0;
+            scene.best = Number(localStorage.getItem('mass_shift_best') || 0);
+            scene.holdTimer = null;   // timer do hold-to-shrink
+            scene.shrinkStartTime = 0;      // momento em que o shrink foi ativado
+            scene.tunnelWarningActive = false;  // evita repetição do aviso antecipado
+            scene.shrinkActive = false;
+            scene.shrinkCooldownActive = false;
+            scene.pipeSpeed = BASE_PIPE_SPEED;
+            scene.currentPhase = -1;
+            scene.pipePairsPassed = 0;
+            scene.lastPipeY = HEIGHT / 2;
+            scene.segmentType = 'normal';
+            scene.segmentTimer = -1;
+            scene.playerTrail = [];
+            scene.decalLines = [];
+
+            generatePlayerTextures(scene); // só texturas do player agora
+            createBackground(scene);
+            createGroups(scene);
+            createPlayer(scene);
+            createHUD(scene);
+            createCollisions(scene);
+            setupInput(scene);
+
+            scene.energyFrame = scene.add.rectangle(WIDTH / 2, HEIGHT - 60, 132, 14, 0x111111, 0.65)
+                .setStrokeStyle(1, 0xffffff, 0.18)
+                .setDepth(50)
+                .setVisible(true);
+
+            scene.shrinkBarBg = scene.add.rectangle(WIDTH / 2, HEIGHT - 60, 120, 8, 0x222222, 0.85)
+                .setDepth(51)
+                .setVisible(true);
+
+            scene.shrinkBarFill = scene.add.rectangle(WIDTH / 2 - 60, HEIGHT - 60, 120, 8, 0x39d5ff, 1)
+                .setOrigin(0, 0.5)
+                .setDepth(52)
+                .setVisible(true);
+
+            scene.missileSpawner = scene.time.addEvent({
+                delay: 3000,
+                callback: () => {
+                    if (scene.state === GAME_STATE.PLAYING && scene.score > 150)
+                        spawnMissileWithWarning(scene);
+                },
+                loop: true, paused: true
+            });
+
+            scene.pipeSpawner = scene.time.addEvent({
+                delay: calcSpawnDelay(BASE_PIPE_SPEED),
+                callback: () => spawnPipePair(scene),
+                loop: true, paused: true
+            });
+
+            scene.scoreTimer = scene.time.addEvent({
+                delay: 100, loop: true, paused: true,
+                callback: () => {
+                    if (scene.state !== GAME_STATE.PLAYING) return;
+                    scene.score += scene.shrinkActive ? 0.6 : 1.35;
+                    updateHUD(scene);
+                }
+            });
+
+            renderReadyMessage(scene);
+        }
+
+        // ─────────────────────────────────────────
+        // TEXTURAS — apenas o player
+        // Os pipes agora usam scene.add.rectangle() diretamente,
+        // igual aos mísseis — sem textura pré-gerada necessária.
+        // ─────────────────────────────────────────
+        function generatePlayerTextures(scene) {
+            const g = scene.make.graphics({ x: 0, y: 0, add: false });
+
+            g.fillStyle(0xf7df1e, 1);
+            g.fillRoundedRect(0, 0, 34, 34, 6);
+            g.lineStyle(4, 0xffffff, 1);
+            g.strokeRoundedRect(0, 0, 34, 34, 6);
+            g.generateTexture('player-big', 34, 34);
+            g.clear();
+
+            g.fillStyle(0x39d5ff, 1);
+            g.fillRoundedRect(0, 0, 18, 18, 5);
+            g.lineStyle(3, 0xffffff, 1);
+            g.strokeRoundedRect(0, 0, 18, 18, 5);
+            g.generateTexture('player-small', 18, 18);
+
+            g.destroy();
+        }
+
+        // ─────────────────────────────────────────
+        // CRIAÇÃO DOS PIPES — padrão idêntico aos mísseis
+        //
+        // Mísseis (funcionam):
+        //   const missile = scene.add.rectangle(x, y, w, h, cor)
+        //   scene.physics.add.existing(missile)
+        //   missile.body.setAllowGravity(false)
+        //   missile.body.setVelocityX(speed)
+        //
+        // Pipes (agora idêntico, + body.setSize explícito):
+        //   scene.add.rectangle() cria o visual com origin (0.5, 0.5)
+        //   scene.physics.add.existing() adiciona o body com o mesmo tamanho
+        //   body.setSize(w, h) garante que o body case pixel-a-pixel com o visual
+        //   body.setOffset(0, 0) zera qualquer deslocamento residual
+        // ─────────────────────────────────────────
+        function createPipe(scene, x, y, w, h, speed, isBottom) {
+            // ── Corpo principal ──
+            // Sem physics.add.existing(): a colisão é feita por AABB manual.
+            // O pipe é só visual + rastreado no grupo scene.pipes para limpeza.
+            const pipe = scene.add.rectangle(x, y, w, h, 0x1a1a1a)
+                .setStrokeStyle(2, 0xffffff, 0.35)
+                .setDepth(15);
+
+            pipe.passScored = false;
+            pipe.isBottom = isBottom;
+            pipe.scored = false;
+            pipe.speedX = speed;   // velocidade armazenada para mover manualmente
+            scene.pipes.add(pipe);
+
+            // ── Cap na boca do gap ──
+            const capY = isBottom
+                ? y - h / 2 - CAP_H / 2
+                : y + h / 2 + CAP_H / 2;
+
+            const cap = scene.add.rectangle(x, capY, w + 16, CAP_H, 0x2c2c2c)
+                .setStrokeStyle(3, 0xffffff, 0.9)
+                .setDepth(16);
+
+            cap.passScored = true;
+            cap.scored = false;
+            cap.speedX = speed;
+            scene.pipes.add(cap);
+        }
+
+        // ─────────────────────────────────────────
+        // SPAWN DE PAR DE PIPES
+        // ─────────────────────────────────────────
+        function calcSpawnDelay(speed) {
+            return Math.round((PIPE_SPACING_PX / speed) * 1000);
+        }
+
+        function spawnPipePair(scene) {
+            if (scene.state !== GAME_STATE.PLAYING) return;
+
+            scene.segmentTimer--;
+            if (scene.segmentTimer <= 0) {
+                const segs = ['normal', 'wave', 'tight', 'shrinkTunnel'];
+                scene.segmentType = Phaser.Utils.Array.GetRandom(segs);
+                scene.segmentTimer = Phaser.Math.Between(5, 9);
+
+                // Aviso antecipado: dispara QUANDO o segmento é selecionado,
+                // antes de qualquer pipe do túnel aparecer na tela.
+                if (scene.segmentType === 'shrinkTunnel' && !scene.tunnelWarningActive) {
+                    scene.tunnelWarningActive = true;
+                    scene.shrinkText.setText('PREPARE-SE: ENCOLHE!');
+                    scene.shrinkText.setAlpha(1);
+                    scene.tweens.add({
+                        targets: scene.shrinkText,
+                        alpha: 0.3,
+                        duration: 280,
+                        yoyo: true,
+                        repeat: 4,
+                        onComplete: () => {
+                            scene.tunnelWarningActive = false;
+                            // Mantém visível enquanto o segmento estiver ativo
+                            if (scene.segmentType === 'shrinkTunnel')
+                                scene.shrinkText.setAlpha(0.8);
+                        }
+                    });
+                }
+            }
+
+            const t = Math.min(1, scene.score / 1200);
+            const speed = Math.round(165 + Math.pow(t, 1.6) * 140);
+            scene.pipeSpeed = speed;
+
+            const newDelay = calcSpawnDelay(speed);
+            if (Math.abs(scene.pipeSpawner.delay - newDelay) > 40)
+                scene.pipeSpawner.delay = newDelay;
+
+            let gap, variation;
+            switch (scene.segmentType) {
+                case 'normal':
+                    gap = Phaser.Math.Clamp(185 - t * 55, 130, 185);
+                    variation = Phaser.Math.Between(-65, 65);
+                    break;
+                case 'wave':
+                    gap = 158;
+                    variation = Math.round(Math.sin(scene.time.now * 0.0025) * 75);
+                    break;
+                case 'tight':
+                    gap = 125;
+                    variation = Phaser.Math.Between(-30, 30);
+                    break;
+                case 'shrinkTunnel':
+                    gap = 105;
+                    variation = Phaser.Math.Between(-20, 20);
+                    // aviso já foi dado no momento da seleção do segmento
+                    break;
+                default:
+                    gap = 160; variation = 0;
+            }
+
+            const minCY = MIN_PIPE_H + gap / 2;
+            const maxCY = FLOOR_Y - MIN_PIPE_H - gap / 2;
+            const MAX_STEP = 90;
+
+            let centerY = scene.lastPipeY + variation;
+            centerY = Phaser.Math.Clamp(centerY, scene.lastPipeY - MAX_STEP, scene.lastPipeY + MAX_STEP);
+            centerY = Phaser.Math.Clamp(centerY, minCY, maxCY);
+            scene.lastPipeY = centerY;
+
+            const topH = centerY - gap / 2;
+            const bottomStartY = centerY + gap / 2;
+            const bottomH = FLOOR_Y - bottomStartY;
+
+            if (topH < MIN_PIPE_H || bottomH < MIN_PIPE_H) return;
+
+            const spawnX = WIDTH + PIPE_WIDTH / 2 + 10;
+            createPipe(scene, spawnX, topH / 2, PIPE_WIDTH, topH, speed, false);
+            createPipe(scene, spawnX, bottomStartY + bottomH / 2, PIPE_WIDTH, bottomH, speed, true);
+            createGateMarker(scene, spawnX, centerY, gap);
+            scene.pipePairsPassed++;
+        }
+
+        // ─────────────────────────────────────────
+        // LIMPEZA DE PIPES
+        // ─────────────────────────────────────────
+        function updatePipeCleanup(scene) {
+            if (!scene.pipes || !scene.pipes.children) return;
+
+            scene.pipes.children.each((pipe) => {
+                if (!pipe || !pipe.active) return;
+
+                // Move o pipe manualmente (sem physics body)
+                pipe.x -= (pipe.speedX || scene.pipeSpeed) / 60;
+
+                if (!pipe.passScored && !pipe.scored &&
+                    pipe.x + pipe.width / 2 < scene.player.x) {
+                    pipe.scored = true;
+                    scene.score += scene.shrinkActive ? 5 : 12;
+                    updateHUD(scene);
+                }
+                if (pipe.x < -150) pipe.destroy();
+            });
+
+            scene.phaseMarks.children.each((mark) => {
+                if (!mark || !mark.active) return;
+                mark.x -= scene.pipeSpeed / 60;
+                if (mark.x < -60) mark.destroy();
+            });
+
+            if (scene.missiles) {
+                scene.missiles.children.each((m) => {
+                    if (!m || !m.active) return;
+                    if (m.trail) { m.trail.setPosition(m.x + 26, m.y); m.trail.setAlpha(Phaser.Math.FloatBetween(0.3, 0.55)); }
+                    if (m.trailPieces) {
+                        m.trailPieces.forEach((p, i) => {
+                            if (!p) return;
+                            p.setPosition(m.x + 34 + i * 10, m.y);
+                            p.setAlpha(Phaser.Math.FloatBetween(0.12, 0.35));
+                        });
+                    }
+                    if (m.x < -150) {
+                        if (m.trail) m.trail.destroy();
+                        if (m.trailPieces) m.trailPieces.forEach(p => p && p.destroy());
+                        m.destroy();
+                    }
+                });
+            }
+
+            scene.decalLines = scene.decalLines.filter(ln => {
+                if (!ln || !ln.active) return false;
+                ln.x -= scene.pipeSpeed / 60;
+                if (ln.x < -80) { ln.destroy(); return false; }
+                return true;
+            });
+        }
+
+        // ─────────────────────────────────────────
+        // FASES VISUAIS
+        // ─────────────────────────────────────────
+        function updatePhaseVisuals(scene) {
+            const s = Math.floor(scene.score);
+            if (s < 150) applyPhase(scene, 0, 0x161616, 0xf7df1e);
+            else if (s < 400) applyPhase(scene, 1, 0x001a33, 0x39d5ff);
+            else if (s < 800) applyPhase(scene, 2, 0x2b0000, 0xff4d4d);
+            else applyPhase(scene, 3, 0x051a05, 0x39ff14);
+
+            // Esconde o aviso de túnel quando o segmento muda para outro tipo
+            if (scene.segmentType !== 'shrinkTunnel' && !scene.shrinkActive && !scene.shrinkCooldownActive) {
+                scene.shrinkText.setAlpha(0);
+            }
+        }
+
+        function applyPhase(scene, phaseId, bgColor, accentColor) {
+            if (scene.currentPhase === phaseId) return;
+            scene.currentPhase = phaseId;
+            scene.cameras.main.flash(500, 255, 255, 255, 0.3);
+            scene.cameras.main.setBackgroundColor(bgColor);
+            scene.bgBack.setTint(bgColor);
+            scene.bgMid.setTint(bgColor);
+            scene.bgFront.setTint(bgColor);
+            if (scene.playerGlow) scene.playerGlow.fillColor = accentColor;
+            scene.tweens.add({
+                targets: scene.scoreText, scale: 1.3,
+                color: Phaser.Display.Color.IntegerToColor(accentColor).rgba,
+                duration: 300, yoyo: true
+            });
+        }
+
+        function updatePhaseDecor(scene) {
+            if (scene.state !== GAME_STATE.PLAYING) return;
+            if (Phaser.Math.Between(0, 100) < 5) {
+                const ln = scene.add.rectangle(
+                    WIDTH + 10, Phaser.Math.Between(90, HEIGHT - 90),
+                    Phaser.Math.Between(20, 60), 2, 0xffffff, 0.08
+                ).setDepth(11);
+                scene.decalLines.push(ln);
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // BACKGROUND
+        // ─────────────────────────────────────────
+        function createBackground(scene) {
+            scene.bgBack = scene.add.tileSprite(0, 0, WIDTH, HEIGHT, null).setOrigin(0);
+            scene.bgMid = scene.add.tileSprite(0, 0, WIDTH, HEIGHT, null).setOrigin(0);
+            scene.bgFront = scene.add.tileSprite(0, 0, WIDTH, HEIGHT, null).setOrigin(0);
+
+            const g1 = scene.make.graphics({ x: 0, y: 0, add: false });
+            g1.fillStyle(0x2a2a2a, 1); g1.fillRect(0, 0, WIDTH, HEIGHT);
+            for (let i = 0; i < 45; i++) {
+                const x = (i * 83) % WIDTH, h = 90 + (i * 13) % 180;
+                g1.fillStyle(0x262626, 1); g1.fillRect(x, HEIGHT - h, 34, h);
+            }
+            g1.lineStyle(2, 0x333333, 1);
+            for (let y = 0; y < HEIGHT; y += 70) g1.lineBetween(0, y, WIDTH, y);
+            g1.generateTexture('bg-back', WIDTH, HEIGHT); g1.destroy();
+
+            const g2 = scene.make.graphics({ x: 0, y: 0, add: false });
+            g2.fillStyle(0x000000, 0); g2.fillRect(0, 0, WIDTH, HEIGHT);
+            for (let i = 0; i < 10; i++) {
+                const x = i * 70 + 20, h = 130 + (i * 29) % 160;
+                g2.fillStyle(0x3a3a3a, 1); g2.fillRect(x, HEIGHT - h, 52, h);
+                g2.lineStyle(3, 0xffffff, 0.25); g2.strokeRect(x, HEIGHT - h, 52, h);
+            }
+            g2.generateTexture('bg-mid', WIDTH, HEIGHT); g2.destroy();
+
+            const g3 = scene.make.graphics({ x: 0, y: 0, add: false });
+            g3.fillStyle(0x000000, 0); g3.fillRect(0, 0, WIDTH, HEIGHT);
+            g3.fillStyle(0x1f1f1f, 1); g3.fillRect(0, FLOOR_Y, WIDTH, HEIGHT - FLOOR_Y);
+            for (let i = 0; i < WIDTH; i += 24) {
+                g3.fillStyle(i % 48 === 0 ? 0xffffff : 0x2a2a2a, i % 48 === 0 ? 0.18 : 1);
+                g3.fillRect(i, FLOOR_Y, 12, HEIGHT - FLOOR_Y);
+            }
+            g3.generateTexture('bg-front', WIDTH, HEIGHT); g3.destroy();
+
+            scene.bgBack.setTexture('bg-back');
+            scene.bgMid.setTexture('bg-mid');
+            scene.bgFront.setTexture('bg-front');
+
+            scene.stars = [];
+            for (let i = 0; i < 20; i++) {
+                const star = scene.add.circle(
+                    Phaser.Math.Between(0, WIDTH), Phaser.Math.Between(0, HEIGHT - 200),
+                    Phaser.Math.Between(1, 2), 0xffffff, Phaser.Math.FloatBetween(0.15, 0.5)
+                ).setDepth(5);
+                scene.tweens.add({ targets: star, alpha: { from: 0.1, to: 0.6 }, duration: Phaser.Math.Between(800, 2000), yoyo: true, repeat: -1 });
+                scene.stars.push(star);
+            }
+
+            scene.vignette = scene.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x000000, 0.0).setDepth(30);
+            scene.flash = scene.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0xffffff, 0).setDepth(31);
+            scene.scanlines = scene.add.graphics().setDepth(29);
+            scene.scanlines.lineStyle(1, 0xffffff, 0.04);
+            for (let y = 0; y < HEIGHT; y += 4) scene.scanlines.lineBetween(0, y, WIDTH, y);
+        }
+
+        // ─────────────────────────────────────────
+        // PLAYER
+        // ─────────────────────────────────────────
+        function createPlayer(scene) {
+            scene.player = scene.physics.add.sprite(110, HEIGHT * 0.45, 'player-big');
+            scene.player.setDepth(20);
+            scene.player.body.setAllowGravity(false);
+            scene.player.body.setSize(28, 28);
+            scene.player.body.setOffset(3, 3);
+            scene.player.baseGravity = 1250;
+            scene.player.shrinkGravity = 900;
+            scene.player.jumpForceBig = -355;
+            scene.player.jumpForceSmall = -285;
+
+            scene.playerGlow = scene.add.circle(scene.player.x, scene.player.y, 26, 0xf7df1e, 0.12).setDepth(19);
+            scene.playerOutline = scene.add.rectangle(scene.player.x, scene.player.y, 40, 40).setStrokeStyle(2, 0xffffff, 0.28).setDepth(18);
+            scene.playerDanger = scene.add.rectangle(scene.player.x, scene.player.y, 44, 44).setStrokeStyle(3, 0xff4d4d, 0).setDepth(21);
+        }
+
+        function updatePlayerTrail(scene) {
+            if (!scene.player || scene.state !== GAME_STATE.PLAYING) return;
+            const color = scene.shrinkActive ? 0x39d5ff : 0xf7df1e;
+            const trail = scene.add.circle(scene.player.x, scene.player.y, scene.shrinkActive ? 4 : 7, color, 0.35).setDepth(10);
+            scene.playerTrail.push(trail);
+            scene.tweens.add({
+                targets: trail,
+                x: scene.player.x - Phaser.Math.Between(10, 25),
+                y: scene.player.y + Phaser.Math.Between(-5, 5),
+                scale: 0.2, alpha: 0, duration: 300, ease: 'Cubic.easeOut',
+                onComplete: () => trail.destroy()
+            });
+            if (scene.playerTrail.length > 15) {
+                const old = scene.playerTrail.shift();
+                if (old && old.active) old.destroy();
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // GRUPOS, HUD, COLISÕES, INPUT
+        // ─────────────────────────────────────────
+        function createGroups(scene) {
+            scene.pipes = scene.add.group();        // grupo simples — colisão é AABB manual
+            scene.phaseMarks = scene.add.group();
+            scene.missiles = scene.physics.add.group(); // mantém physics para overlap com player
+        }
+        function createHUD(scene) {
+            // Painel superior translúcido
+            scene.hudTop = scene.add.rectangle(WIDTH / 2, 36, WIDTH - 24, 52, 0x000000, 0.28)
+                .setStrokeStyle(2, 0xffffff, 0.10)
+                .setDepth(40);
+
+            // Linha de brilho superior
+            scene.hudTopGlow = scene.add.rectangle(WIDTH / 2, 12, WIDTH - 40, 2, 0xffffff, 0.10)
+                .setDepth(41);
+
+            // Score principal (estilo da versão NEON)
+            scene.scoreText = scene.add.text(18, 18, 'DEPTH: 0m', {
+                fontFamily: 'Arial',
+                fontSize: '24px',
+                fontStyle: 'bold',
+                color: '#ffffff'
+            }).setDepth(42);
+
+            // Recorde no canto direito
+            scene.bestText = scene.add.text(WIDTH - 18, 20, `BEST: ${scene.best}m`, {
+                fontFamily: 'Arial',
+                fontSize: '16px',
+                fontStyle: 'bold',
+                color: '#bdbdbd'
+            }).setOrigin(1, 0).setDepth(42);
+
+            // Texto central de estado/instrução
+            scene.stateText = scene.add.text(WIDTH / 2, HEIGHT * 0.22,
+                'MASS_SHIFT\n\CLICAR: PULAR\n 2x CLIQUE: ENCOLHER', {
+                fontFamily: 'Arial',
+                fontSize: '24px',
+                fontStyle: 'bold',
+                color: '#ffffff',
+                align: 'center'
+            }).setOrigin(0.5).setDepth(45);
+
+            scene.stateSubGlow = scene.add.text(WIDTH / 2, HEIGHT * 0.22,
+                'MASS_SHIFT\n\CLICAR: PULAR\n 2x CLIQUE: ENCOLHER', {
+                fontFamily: 'Arial',
+                fontSize: '24px',
+                fontStyle: 'bold',
+                color: '#00ffff',
+                align: 'center'
+            }).setOrigin(0.5).setDepth(44).setAlpha(0.12);
+
+            // Texto contextual acima da barra
+            scene.shrinkText = scene.add.text(WIDTH / 2, HEIGHT - 108, '', {
+                fontFamily: 'Arial',
+                fontSize: '16px',
+                fontStyle: 'bold',
+                color: '#39d5ff',
+                align: 'center'
+            }).setOrigin(0.5).setDepth(45).setAlpha(0);
+
+            // Dica minimalista fixa na parte inferior
+            scene.hintText = scene.add.text(WIDTH / 2, HEIGHT - 94, 'CLICAR: PULO  |  SEGURAR: ENCOLHER', {
+                fontFamily: 'Arial',
+                fontSize: '14px',
+                color: '#6f6f6f',
+                fontStyle: 'bold'
+            }).setOrigin(0.5).setDepth(45);
+
+            // Tela de game over
+            scene.gameOverTitle = scene.add.text(WIDTH / 2, HEIGHT / 2 - 30, '', {
+                fontFamily: 'Arial',
+                fontSize: '38px',
+                fontStyle: 'bold',
+                color: '#ff0055',
+                align: 'center',
+                stroke: '#000000',
+                strokeThickness: 6
+            }).setOrigin(0.5).setDepth(47).setVisible(false);
+
+            scene.gameOverText = scene.add.text(WIDTH / 2, HEIGHT / 2 + 38, '', {
+                fontFamily: 'Arial',
+                fontSize: '18px',
+                color: '#ffffff',
+                align: 'center'
+            }).setOrigin(0.5).setDepth(47).setVisible(false);
+
+
+
+
+            scene.deathOverlay = scene.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x000000, 0.0)
+                .setDepth(70)
+                .setVisible(false);
+
+            scene.deathShadow = scene.add.rectangle(WIDTH / 2 + 5, HEIGHT / 2 + 8, 300, 250, 0x00ffff, 0.8)
+                .setDepth(71)
+                .setVisible(false);
+
+            scene.deathPanel = scene.add.rectangle(WIDTH / 2, HEIGHT / 2, 300, 250, 0x111111, 0.65)
+                .setStrokeStyle(4, 0xffffff, 1)
+                .setDepth(72)
+                .setVisible(false);
+
+            scene.deathTopBar = scene.add.rectangle(WIDTH / 2, HEIGHT / 2 - 110, 300, 24, 0xff0055, 1)
+                .setDepth(73)
+                .setVisible(false);
+
+            scene.deathTopLabel = scene.add.text(WIDTH / 2, HEIGHT / 2 - 110, 'FALHA NO SISTEMA ', {
+                fontFamily: 'Arial',
+                fontSize: '12px',
+                fontStyle: 'bold',
+                color: '#000000'
+            }).setOrigin(0.5).setDepth(74).setVisible(false);
+
+            scene.deathTitleGlow = scene.add.text(WIDTH / 2, HEIGHT / 2 - 56, 'NÚCLEO\nCOLAPSADO', {
+                fontFamily: 'Arial',
+                fontSize: '29px',
+                fontStyle: 'bold',
+                align: 'center',
+                color: '#00ffff'
+            }).setOrigin(0.5).setDepth(74).setAlpha(0).setVisible(false);
+
+            scene.deathTitle = scene.add.text(WIDTH / 2, HEIGHT / 2 - 56, 'NÚCLEO\nCOLAPSADO', {
+                fontFamily: 'Arial',
+                fontSize: '28px',
+                fontStyle: 'bold',
+                align: 'center',
+                color: '#ffffff',
+                stroke: '#000000',
+                strokeThickness: 6
+            }).setOrigin(0.5).setDepth(75).setVisible(false);
+
+            scene.deathScoreBox = scene.add.rectangle(WIDTH / 2 - 72, HEIGHT / 2 + 20, 110, 58, 0xf7df1e, 1)
+                .setStrokeStyle(3, 0x000000, 1)
+                .setDepth(73)
+                .setVisible(false);
+
+            scene.deathBestBox = scene.add.rectangle(WIDTH / 2 + 72, HEIGHT / 2 + 20, 110, 58, 0x39d5ff, 1)
+                .setStrokeStyle(3, 0x000000, 1)
+                .setDepth(73)
+                .setVisible(false);
+
+            scene.deathScoreText = scene.add.text(WIDTH / 2 - 72, HEIGHT / 2 + 20, 'FINAL\n0', {
+                fontFamily: 'Arial',
+                fontSize: '18px',
+                fontStyle: 'bold',
+                align: 'center',
+                color: '#000000'
+            }).setOrigin(0.5).setDepth(74).setVisible(false);
+
+            scene.deathBestText = scene.add.text(WIDTH / 2 + 72, HEIGHT / 2 + 20, 'BEST\n0', {
+                fontFamily: 'Arial',
+                fontSize: '18px',
+                fontStyle: 'bold',
+                align: 'center',
+                color: '#000000'
+            }).setOrigin(0.5).setDepth(74).setVisible(false);
+
+            scene.deathRestartShadow = scene.add.rectangle(WIDTH / 2 + 6, HEIGHT / 2 + 102 + 6, 210, 42, 0x00ffff, 1)
+                .setDepth(72)
+                .setVisible(false);
+
+            scene.deathRestartBtn = scene.add.rectangle(WIDTH / 2, HEIGHT / 2 + 102, 210, 42, 0x000000, 1)
+                .setStrokeStyle(3, 0xffffff, 1)
+                .setDepth(73)
+                .setVisible(false);
+
+            scene.deathRestartText = scene.add.text(WIDTH / 2, HEIGHT / 2 + 102, 'Clique para reiniciar', {
+                fontFamily: 'Arial',
+                fontSize: '18px',
+                fontStyle: 'bold',
+                color: '#ffffff'
+            }).setOrigin(0.5).setDepth(74).setVisible(false);
+
+            scene.deathDecoLeft = scene.add.rectangle(WIDTH / 2 - 128, HEIGHT / 2 - 84, 18, 18, 0x00ffff, 1)
+                .setDepth(74)
+                .setVisible(false);
+
+            scene.deathDecoRight = scene.add.rectangle(WIDTH / 2 + 128, HEIGHT / 2 + 84, 18, 18, 0xff0055, 1)
+                .setDepth(74)
+                .setVisible(false);
+
+
+
+            // START MENU
+            scene.startOverlay = scene.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x000000, 0.0)
+                .setDepth(60)
+                .setVisible(false);
+
+            scene.startShadow = scene.add.rectangle(WIDTH / 2 +6, HEIGHT / 2 + 8, 310, 300, 0xf7df1e, 0.96)
+                .setDepth(61)
+                .setVisible(false);
+
+            scene.startPanel = scene.add.rectangle(WIDTH / 2, HEIGHT / 2, 310, 300, 0x101010, 0.96)
+                .setStrokeStyle(4, 0xffffff, 1)
+                .setDepth(62)
+                .setVisible(false);
+
+            scene.startTopBar = scene.add.rectangle(WIDTH / 2, HEIGHT / 2 - 138, 310, 24, 0x39d5ff, 1)
+                .setDepth(63)
+                .setVisible(false);
+
+            scene.startTopLabel = scene.add.text(WIDTH / 2, HEIGHT / 2 - 138, 'BOOT SEQUENCE', {
+                fontFamily: 'Arial',
+                fontSize: '12px',
+                fontStyle: 'bold',
+                color: '#000000'
+            }).setOrigin(0.5).setDepth(64).setVisible(false);
+
+            scene.startTitleGlow = scene.add.text(WIDTH / 2, HEIGHT / 2 - 80, 'FLAPPY\nMASS', {
+                fontFamily: 'Arial',
+                fontSize: '34px',
+                fontStyle: 'bold',
+                align: 'center',
+                color: '#39d5ff'
+            }).setOrigin(0.5).setDepth(64).setAlpha(0).setVisible(false);
+
+            scene.startTitle = scene.add.text(WIDTH / 2, HEIGHT / 2 - 80, 'FLAPPY\nMASS', {
+                fontFamily: 'Arial',
+                fontSize: '34px',
+                fontStyle: 'bold',
+                align: 'center',
+                color: '#ffffff',
+                stroke: '#000000',
+                strokeThickness: 6
+            }).setOrigin(0.5).setDepth(65).setVisible(false);
+
+            scene.startSubtitle = scene.add.text(WIDTH / 2, HEIGHT / 2 - 22, 'SOBREVIVA AOS TÚNEIS', {
+                fontFamily: 'Arial',
+                fontSize: '14px',
+                fontStyle: 'bold',
+                color: '#bdbdbd',
+                align: 'center'
+            }).setOrigin(0.5).setDepth(64).setVisible(false);
+
+            scene.startJumpBox = scene.add.rectangle(WIDTH / 2 - 68, HEIGHT / 2 + 32, 118, 62, 0xf7df1e, 1)
+                .setStrokeStyle(3, 0x000000, 1)
+                .setDepth(63)
+                .setVisible(false);
+
+            scene.startShrinkBox = scene.add.rectangle(WIDTH / 2 + 68, HEIGHT / 2 + 32, 118, 62, 0x39d5ff, 1)
+                .setStrokeStyle(3, 0x000000, 1)
+                .setDepth(63)
+                .setVisible(false);
+
+            scene.startJumpText = scene.add.text(WIDTH / 2 - 68, HEIGHT / 2 + 32, 'BARRA\nPULO', {
+                fontFamily: 'Arial',
+                fontSize: '18px',
+                fontStyle: 'bold',
+                align: 'center',
+                color: '#000000'
+            }).setOrigin(0.5).setDepth(64).setVisible(false);
+
+            scene.startShrinkText = scene.add.text(WIDTH / 2 + 68, HEIGHT / 2 + 32, 'BARRA 2x\nENCOLHER', {
+                fontFamily: 'Arial',
+                fontSize: '18px',
+                fontStyle: 'bold',
+                align: 'center',
+                color: '#000000'
+            }).setOrigin(0.5).setDepth(64).setVisible(false);
+
+            scene.startButtonShadow = scene.add.rectangle(WIDTH / 2 + 6, HEIGHT / 2 + 112 + 6, 220, 44, 0x39d5ff, 1)
+                .setDepth(62)
+                .setVisible(false);
+
+            scene.startButton = scene.add.rectangle(WIDTH / 2, HEIGHT / 2 + 112, 220, 44, 0x000000, 1)
+                .setStrokeStyle(3, 0xffffff, 1)
+                .setDepth(63)
+                .setVisible(false);
+
+            scene.startButtonText = scene.add.text(WIDTH / 2, HEIGHT / 2 + 112, 'Clique para iniciar', {
+                fontFamily: 'Arial',
+                fontSize: '18px',
+                fontStyle: 'bold',
+                color: '#ffffff'
+            }).setOrigin(0.5).setDepth(64).setVisible(false);
+
+            scene.startDecoLeft = scene.add.rectangle(WIDTH / 2 - 134, HEIGHT / 2 - 108, 18, 18, 0xf7df1e, 1)
+                .setDepth(64)
+                .setVisible(false);
+
+            scene.startDecoRight = scene.add.rectangle(WIDTH / 2 + 134, HEIGHT / 2 + 96, 18, 18, 0x39d5ff, 1)
+                .setDepth(64)
+                .setVisible(false);
+
+        }
+        function createCollisions(scene) {
+            // Pipes: colisão feita via AABB manual em updatePipeCollision()
+            // pois physics.add.existing() em Rectangle não garante body correto.
+            // Missiles: mantém overlap do Phaser pois já funcionava.
+            scene.physics.add.overlap(scene.player, scene.missiles,
+                () => triggerGameOver(scene), null, scene);
+        }
+
+        // ─────────────────────────────────────────
+        // COLISÃO MANUAL COM PIPES — AABB puro
+        //
+        // Não depende do physics body do Phaser: compara diretamente os
+        // retângulos visuais do pipe com a hitbox do player.
+        // Garante pixel-perfect independente de como o Phaser posiciona os bodies.
+
+        //START MENU VISIBILITY ON
+        function showStartMenu(scene) {
+            const items = [
+                scene.startOverlay,
+                scene.startShadow,
+                scene.startPanel,
+                scene.startTopBar,
+                scene.startTopLabel,
+                scene.startTitleGlow,
+                scene.startTitle,
+                scene.startSubtitle,
+                scene.startJumpBox,
+                scene.startShrinkBox,
+                scene.startJumpText,
+                scene.startShrinkText,
+                scene.startButtonShadow,
+                scene.startButton,
+                scene.startButtonText,
+                scene.startDecoLeft,
+                scene.startDecoRight
+            ];
+
+            items.forEach(item => item.setVisible(true));
+
+            scene.startOverlay.setAlpha(0);
+            scene.startShadow.setAlpha(0);
+            scene.startPanel.setAlpha(0);
+            scene.startTopBar.setAlpha(0);
+            scene.startTopLabel.setAlpha(0);
+            scene.startTitleGlow.setAlpha(0);
+            scene.startTitle.setAlpha(0);
+            scene.startSubtitle.setAlpha(0);
+            scene.startJumpBox.setAlpha(0);
+            scene.startShrinkBox.setAlpha(0);
+            scene.startJumpText.setAlpha(0);
+            scene.startShrinkText.setAlpha(0);
+            scene.startButtonShadow.setAlpha(0);
+            scene.startButton.setAlpha(0);
+            scene.startButtonText.setAlpha(0);
+            scene.startDecoLeft.setAlpha(0);
+            scene.startDecoRight.setAlpha(0);
+
+            scene.tweens.add({
+                targets: scene.startOverlay,
+                alpha: 0.38,
+                duration: 180
+            });
+
+            scene.tweens.add({
+                targets: [
+                    scene.startShadow,
+                    scene.startPanel,
+                    scene.startTopBar,
+                    scene.startTopLabel,
+                    scene.startTitle,
+                    scene.startSubtitle,
+                    scene.startJumpBox,
+                    scene.startShrinkBox,
+                    scene.startJumpText,
+                    scene.startShrinkText,
+                    scene.startButtonShadow,
+                    scene.startButton,
+                    scene.startButtonText,
+                    scene.startDecoLeft,
+                    scene.startDecoRight
+                ],
+                alpha: 1,
+                duration: 260,
+                ease: 'Back.easeOut'
+            });
+
+            scene.tweens.add({
+                targets: scene.startTitleGlow,
+                alpha: { from: 0.08, to: 0.22 },
+                duration: 900,
+                yoyo: true,
+                repeat: -1
+            });
+
+            scene.tweens.add({
+                targets: [scene.startShadow, scene.startButtonShadow],
+                x: '+=3',
+                duration: 220,
+                yoyo: true,
+                repeat: -1
+            });
+
+            scene.tweens.add({
+                targets: [scene.startDecoLeft, scene.startDecoRight],
+                angle: 180,
+                duration: 1400,
+                repeat: -1
+            });
+
+            scene.tweens.add({
+                targets: scene.startButton,
+                scaleX: 1.03,
+                scaleY: 1.03,
+                duration: 700,
+                yoyo: true,
+                repeat: -1
+            });
+        }
+
+        //SHOW MENU VISIBILITY OFF
+        function hideStartMenu(scene) {
+            const items = [
+                scene.startOverlay,
+                scene.startShadow,
+                scene.startPanel,
+                scene.startTopBar,
+                scene.startTopLabel,
+                scene.startTitleGlow,
+                scene.startTitle,
+                scene.startSubtitle,
+                scene.startJumpBox,
+                scene.startShrinkBox,
+                scene.startJumpText,
+                scene.startShrinkText,
+                scene.startButtonShadow,
+                scene.startButton,
+                scene.startButtonText,
+                scene.startDecoLeft,
+                scene.startDecoRight
+            ];
+
+            items.forEach(item => {
+                if (!item) return;
+                item.setVisible(false);
+                item.setAlpha(1);
+                item.setScale(1);
+                item.angle = 0;
+            });
+        }
+        // ─────────────────────────────────────────
+        function updatePipeCollision(scene) {
+            if (scene.state !== GAME_STATE.PLAYING) return;
+            if (!scene.player || !scene.player.active) return;
+
+            // Hitbox do player (menor que o visual para ser mais justo)
+            const hw = scene.shrinkActive ? 7 : 11;   // half-width
+            const hh = scene.shrinkActive ? 7 : 11;   // half-height
+            const px = scene.player.x;
+            const py = scene.player.y;
+
+            const pLeft = px - hw;
+            const pRight = px + hw;
+            const pTop = py - hh;
+            const pBottom = py + hh;
+
+            scene.pipes.children.each((pipe) => {
+                if (!pipe || !pipe.active) return;
+
+                // Bordas do pipe baseadas na posição visual (origin 0.5, 0.5)
+                const pipeLeft = pipe.x - pipe.width / 2;
+                const pipeRight = pipe.x + pipe.width / 2;
+                const pipeTop = pipe.y - pipe.height / 2;
+                const pipeBottom = pipe.y + pipe.height / 2;
+
+                // Interseção AABB
+                if (pRight > pipeLeft &&
+                    pLeft < pipeRight &&
+                    pBottom > pipeTop &&
+                    pTop < pipeBottom) {
+                    triggerGameOver(scene);
+                }
+            });
+        }
+        //Handle Input
+        function handleInput(scene) {
+            const currentTime = scene.time.now;
+            const delta = currentTime - scene.lastClickTime;
+
+            if (delta < DOUBLE_TAP_DELAY) {
+                // --- DETECTOU CLIQUE DUPLO ---
+                if (!scene.shrinkCooldownActive) {
+                    scene.shrinkLocked = true;
+                    activateShrink(scene);
+                }
+            } else {
+                // --- CLIQUE SIMPLES (Pulo ou Início de Hold) ---
+                executeJump(scene);
+            }
+
+            scene.lastClickTime = currentTime;
+        }
+
+        // ─────────────────────────────────────────
+        // INPUT — hold-to-shrink
+        //
+        // Tap curto  (< HOLD_THRESHOLD ms): pulo
+        // Segurar    (≥ HOLD_THRESHOLD ms): encolhe enquanto pressionado
+        // Soltar enquanto encolhido       : deactivateShrink + cooldown proporcional
+        //
+        // Teclado: SPACE = pulo, SHIFT hold/release = encolhe/cresce
+        // ─────────────────────────────────────────
+        function setupInput(scene) {
+            scene.input.on('pointerdown', () => {
+                if (scene.state === GAME_STATE.DEAD) { restartScene(scene); return; }
+                if (scene.state === GAME_STATE.READY) startRun(scene);
+                if (scene.state !== GAME_STATE.PLAYING) return;
+
+                const currentTime = scene.time.now;
+                const delta = currentTime - scene.lastClickTime;
+                scene.lastClickTime = currentTime;
+
+                // 1. Lógica de Clique Duplo (Trava o modo)
+                if (delta < 300) { // Janela de 300ms
+                    if (scene.holdTimer) { scene.holdTimer.remove(false); scene.holdTimer = null; }
+
+                    if (!scene.shrinkCooldownActive) {
+                        scene.shrinkLocked = true; // Ativa a trava
+                        activateShrink(scene);
+                    }
+                    return; // Interrompe para não processar como clique simples
+                }
+
+                // 2. Lógica de Hold (Diferenciar Tap de Segurar)
+                if (scene.holdTimer) { scene.holdTimer.remove(false); scene.holdTimer = null; }
+
+                scene.holdTimer = scene.time.delayedCall(HOLD_THRESHOLD, () => {
+                    scene.holdTimer = null;
+                    scene.shrinkLocked = false; // Se segurou, não é trava (é manual)
+                    activateShrink(scene);
+                });
+            });
+
+            scene.input.on('pointerup', () => {
+                if (scene.holdTimer) {
+                    // Se soltou rápido: é um Pulo
+                    scene.holdTimer.remove(false);
+                    scene.holdTimer = null;
+                    jump(scene);
+                } else if (scene.shrinkActive && !scene.shrinkLocked) {
+                    // Só desativa ao soltar se NÃO estiver travado pelo clique duplo
+                    deactivateShrink(scene);
+                }
+            });
+
+            // Teclado (Opcional: Barra de espaço também pode alternar)
+            scene.input.keyboard.on('keydown-SPACE', () => {
+                if (scene.state === GAME_STATE.DEAD) { restartScene(scene); return; }
+                if (scene.state === GAME_STATE.READY) startRun(scene);
+                jump(scene);
+            });
+        }
+
+        // ─────────────────────────────────────────
+        // MÍSSEIS
+        // ─────────────────────────────────────────
+        function spawnMissileWithWarning(scene) {
+            const targetY = Phaser.Math.Between(100, HEIGHT - 150);
+            const warning = scene.add.triangle(WIDTH - 30, targetY, 0, 20, 20, 10, 0, 0, 0xff4d4d)
+                .setOrigin(0.5).setDepth(50);
+            scene.tweens.add({
+                targets: warning, alpha: 0, duration: 150, yoyo: true, repeat: 5,
+                onComplete: () => {
+                    warning.destroy();
+                    if (scene.state === GAME_STATE.PLAYING) launchMissile(scene, targetY);
+                }
+            });
+        }
+
+        function launchMissile(scene, y) {
+            const missile = scene.add.rectangle(WIDTH + 50, y, 45, 20, 0xff4d4d)
+                .setStrokeStyle(2, 0xffffff).setDepth(25);
+            scene.physics.add.existing(missile);
+            scene.missiles.add(missile);
+            missile.body.setAllowGravity(false);
+            missile.body.setVelocityX(-(scene.pipeSpeed * 3));
+            missile.trail = scene.add.rectangle(missile.x + 25, missile.y, 18, 8, 0xf7df1e, 0.45).setDepth(24);
+            missile.trailPieces = [];
+            for (let i = 0; i < 6; i++) {
+                missile.trailPieces.push(
+                    scene.add.rectangle(missile.x + 25 + i * 10, missile.y, 16 - i * 2, 8 - i, 0xffd54a, 0.40 - i * 0.05).setDepth(23)
+                );
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // GATE MARKER
+        // ─────────────────────────────────────────
+        function createGateMarker(scene, x, centerY, gap) {
+            const zone = scene.add.rectangle(x + 2, centerY, 12, gap - 8, 0xffffff, 0.05)
+                .setStrokeStyle(2, 0xffffff, 0.18).setDepth(12);
+            scene.phaseMarks.add(zone);
+        }
+
+        // ─────────────────────────────────────────
+        // INÍCIO DE RUN
+        // ─────────────────────────────────────────
+        function startRun(scene) {
+            if (scene.state !== GAME_STATE.READY) return;
+            hideStartMenu(scene);
+            scene.state = GAME_STATE.PLAYING;
+            scene.player.body.setAllowGravity(true);
+            scene.player.body.setGravityY(scene.player.baseGravity);
+            scene.pipeSpawner.paused = false;
+            scene.scoreTimer.paused = false;
+            scene.missileSpawner.paused = false;
+            
+            spawnPipePair(scene);
+        }
+
+        // ─────────────────────────────────────────
+        // PULO / SHRINK
+        // ─────────────────────────────────────────
+        function jump(scene) {
+            if (scene.state !== GAME_STATE.PLAYING && scene.state !== GAME_STATE.READY) return;
+            const vy = scene.shrinkActive ? scene.player.jumpForceSmall : scene.player.jumpForceBig;
+            scene.player.body.setVelocityY(vy);
+            for (let i = 0; i < 3; i++) {
+                const burst = scene.add.circle(scene.player.x, scene.player.y, 5, 0xffffff, 0.4);
+                scene.tweens.add({
+                    targets: burst,
+                    x: scene.player.x - Phaser.Math.Between(10, 30),
+                    y: scene.player.y + Phaser.Math.Between(-10, 10),
+                    alpha: 0, scale: 0.2, duration: 200, onComplete: () => burst.destroy()
+                });
+            }
+            scene.tweens.add({
+                targets: scene.player,
+                scaleX: scene.shrinkActive ? 0.67 : 1.08,
+                scaleY: scene.shrinkActive ? 0.75 : 0.9,
+                duration: 85, yoyo: true, ease: 'Quad.easeOut'
+            });
+            scene.flash.setAlpha(0.05);
+            scene.tweens.add({ targets: scene.flash, alpha: 0, duration: 120 });
+        }
+
+        // ─────────────────────────────────────────
+        // SHRINK
+        // activateShrink: sem delayedCall — deactivate é por pointerup ou auto no update
+        // deactivateShrink: cooldown proporcional ao tempo de uso real
+        // ─────────────────────────────────────────
+        function activateShrink(scene) {
+            if (scene.state !== GAME_STATE.PLAYING || scene.shrinkActive || scene.shrinkCooldownActive) return;
+
+            scene.shrinkActive = true;
+            scene.shrinkStartTime = scene.time.now;  // marca o início para calcular cooldown
+
+            scene.player.setTexture('player-small');
+            scene.player.body.setSize(18, 18);
+            scene.player.body.setOffset(2, 2);
+            scene.player.body.setGravityY(scene.player.shrinkGravity);
+            scene.player.body.setVelocityY(scene.player.body.velocity.y * 0.4);
+            scene.shrinkBarBg.setVisible(true);
+            scene.shrinkBarFill.setVisible(true);
+            if (scene.energyFrame) scene.energyFrame.setVisible(true);
+
+            scene.shrinkBarFill.width = 120;
+            scene.shrinkBarFill.setFillStyle(0x00ff88);
+
+            scene.shrinkText.setText('SHRINK ACTIVE');
+            scene.shrinkText.setAlpha(1);
+
+            scene.tweens.add({
+                targets: scene.shrinkText,
+                scaleX: 1.04,
+                scaleY: 1.04,
+                duration: 120,
+                yoyo: true
+            });
+            scene.cameras.main.shake(80, 0.003);
+        }
+
+        function deactivateShrink(scene, force = false) {
+            if (!scene.shrinkActive) return;  // guard: pode ser chamada por pointerup e auto-deactivate na mesma frame
+            if (scene.shrinkLocked && !force) return;
+
+            scene.shrinkActive = false;
+            scene.shrinkLocked = false; // Destrava o modo ao desligar
+            // Cooldown proporcional: uso mínimo → ~800ms; uso total → 5000ms
+            const usedMs = scene.time.now - scene.shrinkStartTime;
+            const ratio = Math.min(1, usedMs / SHRINK_DURATION);
+            const cooldown = Math.round(SHRINK_MIN_COOLDOWN + ratio * (SHRINK_COOLDOWN - SHRINK_MIN_COOLDOWN));
+            scene.player.setTexture('player-big');
+            scene.player.body.setSize(28, 28);
+            scene.player.body.setOffset(3, 3);
+            scene.player.body.setGravityY(scene.player.baseGravity);
+
+            scene.shrinkCooldownActive = true;
+            scene.shrinkBarFill.width = 0;
+            scene.shrinkBarFill.setFillStyle(0xff0055);
+            scene.shrinkText.setText('RECHARGING...');
+
+            scene.tweens.add({
+                targets: scene.shrinkBarFill,
+                width: 120,
+                duration: cooldown,
+                ease: 'Linear',
+                onComplete: () => {
+                    scene.shrinkCooldownActive = false;
+                    scene.shrinkText.setAlpha(0);
+
+                    scene.tweens.add({
+                        targets: scene.playerOutline,
+                        alpha: 0,
+                        duration: 120,
+                        yoyo: true,
+                        repeat: 2,
+                        onComplete: () => scene.playerOutline.setAlpha(1)
+                    });
+                }
+            });
+
+            scene.tweens.add({
+                targets: scene.shrinkText,
+                alpha: 0.45,
+                duration: 500
+            });
+        }
+
+        // ─────────────────────────────────────────
+        // UPDATE
+        // ─────────────────────────────────────────
+        function update() {
+            const scene = this;
+            updateParallax(scene);
+            updatePhaseDecor(scene);
+            if (!scene.player) return;
+
+            // Barra de shrink: mostra tempo restante baseado no tempo real de uso.
+            // Auto-deactivate quando atingir SHRINK_DURATION (duração máxima).
+            // Localize onde você atualiza a barra de encolhimento (shrinkBarFill)
+            if (scene.shrinkActive) {
+                let usedMs = scene.time.now - scene.shrinkStartTime;
+                let remaining = 1 - (usedMs / SHRINK_DURATION);
+
+                scene.shrinkBarFill.width = Math.max(0, remaining * 120);
+
+                // SE A ENERGIA ACABAR:
+                if (usedMs >= SHRINK_DURATION) {
+                    deactivateShrink(scene, true); // O 'true' força o desligamento mesmo travado
+                }
+            }
+
+
+
+            if (scene.state === GAME_STATE.PLAYING) {
+                updatePlayerAngle(scene);
+                updatePlayerTrail(scene);
+                updateDangerIndicator(scene);
+                updatePipeCollision(scene);    // ← AABB manual, antes da limpeza
+                updatePipeCleanup(scene);
+                updatePhaseVisuals(scene);
+                if (scene.player.y < -50 || scene.player.y > HEIGHT + 50) triggerGameOver(scene);
+            } else if (scene.state === GAME_STATE.READY) {
+                scene.player.y += Math.sin(scene.time.now * 0.006) * 0.25;
+            }
+        }
+
+        function updatePlayerAngle(scene) {
+            if (!scene.player || !scene.player.body) return;
+            scene.player.angle = Phaser.Math.Clamp(scene.player.body.velocity.y * 0.045, -28, 80);
+            scene.playerGlow.setPosition(scene.player.x, scene.player.y);
+            scene.playerOutline.setPosition(scene.player.x, scene.player.y);
+            scene.playerDanger.setPosition(scene.player.x, scene.player.y);
+            const sz = scene.shrinkActive ? 28 : 40;
+            scene.playerOutline.width = sz;
+            scene.playerOutline.height = sz;
+            scene.playerGlow.radius = scene.shrinkActive ? 18 : 24;
+        }
+
+        function updateDangerIndicator(scene) {
+            let nearest = 999;
+            scene.pipes.children.each((pipe) => {
+                if (!pipe || !pipe.active || pipe.passScored) return;
+                const dx = Math.abs(pipe.x - scene.player.x) - (pipe.width + 34) / 2;
+                const dy = Math.abs(pipe.y - scene.player.y) - (pipe.height + 34) / 2;
+                nearest = Math.min(nearest, Math.max(dx, dy));
+            });
+            const alpha = nearest < 90 ? Phaser.Math.Clamp((90 - nearest) / 90, 0, 0.9) : 0;
+            scene.playerDanger.setStrokeStyle(3, 0xff4d4d, alpha);
+            scene.vignette.setAlpha(alpha * 0.18);
+        }
+
+        function updateParallax(scene) {
+            const f = scene.state === GAME_STATE.PLAYING ? scene.pipeSpeed / 60 : 1.4;
+            scene.bgBack.tilePositionX += f * 0.18;
+            scene.bgMid.tilePositionX += f * 0.45;
+            scene.bgFront.tilePositionX += f * 1.0;
+        }
+
+        function updateHUD(scene) {
+            const s = Math.floor(scene.score);
+            scene.scoreText.setText(`DEPTH: ${s}m`);
+            scene.bestText.setText(`BEST: ${Math.max(s, scene.best)}m`);
+
+            // Cores dinâmicas por fase
+            let accent = '#f7df1e';
+            if (s >= 150 && s < 400) accent = '#39d5ff';
+            else if (s >= 400 && s < 800) accent = '#ff4d4d';
+            else if (s >= 800) accent = '#39ff14';
+
+            scene.scoreText.setColor(accent);
+            scene.shrinkText.setColor(scene.shrinkCooldownActive ? '#ff4d4d' : '#39d5ff');
+        }
+
+        function renderReadyMessage(scene) {
+            scene.gameOverTitle.setVisible(false);
+            scene.gameOverText.setVisible(false);
+
+
+            if (scene.stateText) scene.stateText.setVisible(false);
+            if (scene.stateSubGlow) scene.stateSubGlow.setVisible(false);
+
+            scene.hintText.setAlpha(1);
+            showStartMenu(scene);
+            updateHUD(scene);
+        }
+        //GAME OVER MENU
+        function showDeathMenu(scene, finalScore) {
+            const items = [
+                scene.deathOverlay,
+                scene.deathShadow,
+                scene.deathPanel,
+                scene.deathTopBar,
+                scene.deathTopLabel,
+                scene.deathTitleGlow,
+                scene.deathTitle,
+                scene.deathScoreBox,
+                scene.deathBestBox,
+                scene.deathScoreText,
+                scene.deathBestText,
+                scene.deathRestartShadow,
+                scene.deathRestartBtn,
+                scene.deathRestartText,
+                scene.deathDecoLeft,
+                scene.deathDecoRight
+            ];
+
+            items.forEach(item => item.setVisible(true));
+
+            scene.deathOverlay.setAlpha(0);
+            scene.deathShadow.setAlpha(0);
+            scene.deathPanel.setAlpha(0);
+            scene.deathTopBar.setAlpha(0);
+            scene.deathTopLabel.setAlpha(0);
+            scene.deathTitle.setAlpha(0);
+            scene.deathTitleGlow.setAlpha(0);
+            scene.deathScoreBox.setAlpha(0);
+            scene.deathBestBox.setAlpha(0);
+            scene.deathScoreText.setAlpha(0);
+            scene.deathBestText.setAlpha(0);
+            scene.deathRestartShadow.setAlpha(0);
+            scene.deathRestartBtn.setAlpha(0);
+            scene.deathRestartText.setAlpha(0);
+            scene.deathDecoLeft.setAlpha(0);
+            scene.deathDecoRight.setAlpha(0);
+
+            scene.deathScoreText.setText(`FINAL\n${finalScore}`);
+            scene.deathBestText.setText(`BEST\n${scene.best}`);
+
+            scene.tweens.add({
+                targets: scene.deathOverlay,
+                alpha: 0.55,
+                duration: 180
+            });
+
+            scene.tweens.add({
+                targets: [
+                    scene.deathShadow,
+                    scene.deathPanel,
+                    scene.deathTopBar,
+                    scene.deathTopLabel,
+                    scene.deathTitle,
+                    scene.deathScoreBox,
+                    scene.deathBestBox,
+                    scene.deathScoreText,
+                    scene.deathBestText,
+                    scene.deathRestartShadow,
+                    scene.deathRestartBtn,
+                    scene.deathRestartText,
+                    scene.deathDecoLeft,
+                    scene.deathDecoRight
+                ],
+                alpha: 1,
+                y: '+=0',
+                duration: 260,
+                ease: 'Back.easeOut'
+            });
+
+            scene.tweens.add({
+                targets: scene.deathTitleGlow,
+                alpha: 0.18,
+                duration: 220
+            });
+
+            scene.tweens.add({
+                targets: [scene.deathShadow, scene.deathRestartShadow],
+                x: '+=3',
+                duration: 220,
+                yoyo: true,
+                repeat: -1
+            });
+
+            scene.tweens.add({
+                targets: scene.deathTitleGlow,
+                alpha: { from: 0.08, to: 0.22 },
+                duration: 900,
+                yoyo: true,
+                repeat: -1
+            });
+
+            scene.tweens.add({
+                targets: [scene.deathDecoLeft, scene.deathDecoRight],
+                angle: 180,
+                duration: 1400,
+                repeat: -1
+            });
+
+            scene.tweens.add({
+                targets: scene.deathRestartBtn,
+                scaleX: 1.03,
+                scaleY: 1.03,
+                duration: 700,
+                yoyo: true,
+                repeat: -1
+            });
+        }
+        function hideDeathMenu(scene) {
+            const items = [
+                scene.deathOverlay,
+                scene.deathShadow,
+                scene.deathPanel,
+                scene.deathTopBar,
+                scene.deathTopLabel,
+                scene.deathTitleGlow,
+                scene.deathTitle,
+                scene.deathScoreBox,
+                scene.deathBestBox,
+                scene.deathScoreText,
+                scene.deathBestText,
+                scene.deathRestartShadow,
+                scene.deathRestartBtn,
+                scene.deathRestartText,
+                scene.deathDecoLeft,
+                scene.deathDecoRight
+            ];
+
+            items.forEach(item => {
+                if (!item) return;
+                item.setVisible(false);
+                item.setAlpha(1);
+                item.setScale(1);
+                item.angle = 0;
+            });
+        }
+
+        // ─────────────────────────────────────────
+        // GAME OVER
+        // ─────────────────────────────────────────
+        function triggerGameOver(scene) {
+            if (scene.state === GAME_STATE.DEAD) return;
+            scene.state = GAME_STATE.DEAD;
+            scene.pipeSpawner.paused = true;
+            scene.scoreTimer.paused = true;
+            scene.missileSpawner.paused = true;
+
+            const finalScore = Math.floor(scene.score);
+            if (finalScore > scene.best) {
+                scene.best = finalScore;
+                localStorage.setItem('mass_shift_best', scene.best);
+            }
+
+            scene.stateText.setVisible(false);
+            if (scene.stateSubGlow) scene.stateSubGlow.setVisible(false);
+            if (scene.hintText) scene.hintText.setAlpha(0.2);
+            if (scene.shrinkText) scene.shrinkText.setAlpha(0);
+
+            showDeathMenu(scene, finalScore);
+
+            const color = scene.shrinkActive ? 0x39d5ff : 0xf7df1e;
+            for (let i = 0; i < 10; i++) {
+                const angle = (i / 10) * Math.PI * 2;
+                const dist = Phaser.Math.Between(40, 120);
+                const frag = scene.add.rectangle(
+                    scene.player.x, scene.player.y,
+                    Phaser.Math.Between(4, 10), Phaser.Math.Between(4, 10), color
+                ).setDepth(50);
+                scene.tweens.add({
+                    targets: frag,
+                    x: scene.player.x + Math.cos(angle) * dist,
+                    y: scene.player.y + Math.sin(angle) * dist,
+                    alpha: 0, angle: Phaser.Math.Between(-180, 180),
+                    scale: 0.1, duration: 500, ease: 'Quad.easeOut',
+                    onComplete: () => frag.destroy()
+                });
+            }
+
+            scene.physics.pause();
+            const intensity = 0.005 + (scene.pipeSpeed / BASE_PIPE_SPEED) * 0.008;
+            scene.cameras.main.shake(300, intensity);
+        }
+
+        function restartScene(scene) { scene.scene.restart(); }
+    </script>
+</body>
+
+</html>
