@@ -69,7 +69,7 @@
         const PIPE_SPACING_PX = 300;
         const HOLD_THRESHOLD = 180;  // ms para distinguir tap (pulo) de hold (encolhe)
         const SHRINK_MIN_COOLDOWN = 500;  // cooldown mínimo mesmo com uso brevíssimo
-        const SHRINK_DURATION = 1300;
+        const SHRINK_DURATION = 1800;
         const SHRINK_COOLDOWN = 3000;
         const FLOOR_Y = HEIGHT - 68;
         const MIN_PIPE_H = 60;
@@ -89,6 +89,14 @@
             const scene = this;
             this.lastClickTime = 0;       // Armazena o timestamp do último clique
             this.shrinkLocked = false;    // Indica se o modo está travado (pelo clique duplo)
+            this.shiftKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT);
+
+            this.shiftKey.on('down', () => {
+                if (!this.shrinkCooldownActive && !this.shrinkActive) {
+                    this.shrinkLocked = true;
+                    activateShrink(this);
+                }
+            });
             const DOUBLE_TAP_DELAY = 300; // Janela de tempo (ms) para considerar clique duplo
             scene.state = GAME_STATE.READY;
             scene.score = 0;
@@ -106,7 +114,6 @@
             scene.segmentTimer = -1;
             scene.playerTrail = [];
             scene.decalLines = [];
-
             generatePlayerTextures(scene); // só texturas do player agora
             createBackground(scene);
             createGroups(scene);
@@ -569,7 +576,7 @@
             }).setOrigin(0.5).setDepth(45).setAlpha(0);
 
             // Dica minimalista fixa na parte inferior
-            scene.hintText = scene.add.text(WIDTH / 2, HEIGHT - 94, 'CLICAR: PULO  |  SEGURAR: ENCOLHER', {
+            scene.hintText = scene.add.text(WIDTH / 2, HEIGHT - 94, 'CLICAR: PULO  |  SHIFT: ENCOLHER', {
                 fontFamily: 'Arial',
                 fontSize: '14px',
                 color: '#6f6f6f',
@@ -760,7 +767,7 @@
                 color: '#000000'
             }).setOrigin(0.5).setDepth(64).setVisible(false);
 
-            scene.startShrinkText = scene.add.text(WIDTH / 2 + 68, HEIGHT / 2 + 32, 'BARRA 2x\nENCOLHER', {
+            scene.startShrinkText = scene.add.text(WIDTH / 2 + 68, HEIGHT / 2 + 32, 'SHIFT\nENCOLHER', {
                 fontFamily: 'Arial',
                 fontSize: '18px',
                 fontStyle: 'bold',
@@ -977,23 +984,22 @@
             });
         }
         //Handle Input
-        function handleInput(scene) {
-            const currentTime = scene.time.now;
-            const delta = currentTime - scene.lastClickTime;
+       function handleInput(scene) {
 
-            if (delta < DOUBLE_TAP_DELAY) {
-                // --- DETECTOU CLIQUE DUPLO ---
-                if (!scene.shrinkCooldownActive) {
-                    scene.shrinkLocked = true;
-                    activateShrink(scene);
-                }
-            } else {
-                // --- CLIQUE SIMPLES (Pulo ou Início de Hold) ---
-                executeJump(scene);
-            }
-
-            scene.lastClickTime = currentTime;
+    // SHIFT → ativa shrink
+    if (Phaser.Input.Keyboard.JustDown(scene.shiftKey)) {
+        if (!scene.shrinkCooldownActive) {
+            scene.shrinkLocked = true;
+            activateShrink(scene);
         }
+        return; // evita executar pulo no mesmo frame
+    }
+
+    // Clique / espaço → pulo normal
+    if (scene.input.activePointer.isDown || scene.fireKey.isDown) {
+        executeJump(scene);
+    }
+}
 
         // ─────────────────────────────────────────
         // INPUT — hold-to-shrink
